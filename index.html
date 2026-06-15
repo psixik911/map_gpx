@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes, viewport-fit=cover">
+    <title>GPX трекер | Метки только цифры (километры)</title>
+    <!-- Leaflet CSS + JS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <!-- Turf.js для георасчётов -->
+    <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: system-ui, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+            background: #1e3a2f;
+            height: 100vh;
+            width: 100vw;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        /* Панель управления */
+        .control-panel {
+            background: rgba(25, 30, 28, 0.94);
+            backdrop-filter: blur(10px);
+            padding: 10px 16px;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 10px;
+            border-bottom: 1px solid #5f7a5a;
+            z-index: 10;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+        }
+        .file-label {
+            background: #2c7840;
+            color: white;
+            padding: 6px 14px;
+            border-radius: 40px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .file-label:hover { background: #1d8a4a; }
+        #fileInput { display: none; }
+        .geo-btn, .clear-btn {
+            background: #256f8f;
+            border: none;
+            color: white;
+            padding: 6px 14px;
+            border-radius: 40px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .clear-btn { background: #8b5a2b; }
+        .geo-btn:hover { background: #0f5a7a; }
+        .clear-btn:hover { background: #a54f1a; }
+        .status {
+            background: #182218cc;
+            padding: 5px 12px;
+            border-radius: 32px;
+            font-size: 0.75rem;
+            color: #e6f0e6;
+            flex: 1;
+            min-width: 160px;
+            white-space: nowrap;
+            overflow-x: auto;
+        }
+        .legend {
+            background: #262f26d9;
+            padding: 4px 12px;
+            border-radius: 24px;
+            font-size: 0.7rem;
+            color: #eee;
+            display: flex;
+            gap: 12px;
+        }
+        @media (max-width: 680px) {
+            .control-panel { padding: 6px 10px; gap: 6px; }
+            .file-label, .geo-btn, .clear-btn { padding: 5px 10px; font-size: 0.7rem; }
+            .status { font-size: 0.65rem; min-width: 120px; }
+            .legend { font-size: 0.6rem; gap: 8px; }
+        }
+        #map {
+            flex: 1;
+            width: 100%;
+            background: #bed6c6;
+            z-index: 1;
+        }
+        /* МЕТКИ: только ЦИФРЫ, без "км", без иконок */
+        .km-number-marker {
+            background: transparent;
+            border: none;
+        }
+        .km-number-label {
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(3px);
+            color: #ffefb9;
+            font-weight: bold;
+            font-size: 11px;
+            padding: 2px 5px;
+            min-width: 28px;
+            text-align: center;
+            border-radius: 20px;
+            border: 1px solid #ffaa33;
+            font-family: monospace;
+            white-space: nowrap;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+            cursor: pointer;
+            letter-spacing: 0.5px;
+        }
+        /* Только цифры, без дополнительных символов */
+        .leaflet-popup-content {
+            font-size: 13px;
+            font-weight: 500;
+            min-width: 160px;
+        }
+    </style>
+</head>
+<body>
+<div class="control-panel">
+    <label class="file-label" for="fileInput">
+        📂 Загрузить GPX
+        <input type="file" id="fileInput" accept=".gpx, .GPX">
+    </label>
+    <button class="geo-btn" id="locateBtn">📍 Моя геолокация</button>
+    <button class="clear-btn" id="clearTracksBtn">🗑 Очистить всё</button>
+    <div class="status" id="statusMsg">⛰ Готов | Загрузите GPX</div>
+    <div class="legend">
+        <span>🔵 Трек</span>
+        <span>🔢 Метки: только цифры (км) — нажми для остаточного пути</span>
+    </div>
+</div>
+<div id="map"></div>
+
+<script>
+    // ---------- ИНИЦИАЛИЗАЦИЯ КАРТЫ (OpenStreetMap) ----------
+    const map = L.map('map').setView([55.7512, 37.6184], 12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        maxZoom: 19
+    }).addTo(map);
+
+    // Глобальные переменные
+    let currentPolyline = null;           // текущая линия трека
+    let kmMarkersLayer = L.layerGroup().addTo(map);  // слой для цифровых меток
+    let fullLineGeoJson = null;            // LineString (turf) для расчётов остаточного пути
+    let totalTrackLengthKm = 0;             // полная длина трека в км
+
+    // Функция статуса
+    function setStatus(text, isError = false) {
+        const statusDiv = document.getElementById('statusMsg');
+        statusDiv.innerHTML = text;
+        if (isError) {
+            statusDiv.style.background = "#8b3c2ccc";
+            setTimeout(() => {
+                if (document.getElementById('statusMsg').innerHTML === text)
+                    statusDiv.style.background = "#182218cc";
+            }, 3000);
+        } else {
+            statusDiv.style.background = "#182218cc";
+        }
+    }
+
+    // Очистка всего
+    function clearAllTracksAndMarkers() {
+        if (currentPolyline && map.hasLayer(currentPolyline)) map.removeLayer(currentPolyline);
+        kmMarkersLayer.clearLayers();
+        currentPolyline = null;
+        fullLineGeoJson = null;
+        totalTrackLengthKm = 0;
+        setStatus("🧹 Трек и метки удалены. Загрузите GPX.");
+    }
+
+    // Расчёт остаточного пути от точки до финиша (в км)
+    function getRemainingDistanceFromPoint(point, line, totalLength) {
+        try {
+            const snapped = turf.nearestPointOnLine(line, point, { units: 'kilometers' });
+            const distanceFromStart = snapped.properties.location;
+            const remaining = Math.max(0, totalLength - distanceFromStart);
+            return remaining;
+        } catch (e) {
+            console.warn("Ошибка расчёта остатка", e);
+            return null;
+        }
+    }
+
+    // === ПАРСИНГ GPX И СОЗДАНИЕ ТРЕКА С МЕТКАМИ — ТОЛЬКО ЦИФРЫ (номера километров) ===
+    async function parseGpxAndBuildNumberOnlyTrack(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const gpxText = e.target.result;
+                const parser = new DOMParser();
+                const xmlDoc = parser.parseFromString(gpxText, "application/xml");
+                if (xmlDoc.querySelector('parsererror')) {
+                    reject("Некорректный GPX файл");
+                    return;
+                }
+                // Сбор всех точек трека
+                const points = [];
+                const trackPoints = xmlDoc.querySelectorAll('trkpt, rtept');
+                if (trackPoints.length === 0) {
+                    reject("Файл не содержит точек трека (trkpt или rtept)");
+                    return;
+                }
+                trackPoints.forEach(pt => {
+                    let lat = parseFloat(pt.getAttribute('lat'));
+                    let lon = parseFloat(pt.getAttribute('lon'));
+                    if (!isNaN(lat) && !isNaN(lon)) {
+                        points.push([lon, lat]); // [lng, lat] для turf
+                    }
+                });
+                if (points.length < 2) {
+                    reject("Недостаточно точек (минимум 2)");
+                    return;
+                }
+                // Построение линии
+                const line = turf.lineString(points);
+                const totalKm = turf.length(line, { units: 'kilometers' });
+                
+                // Генерация позиций меток через каждый 1 километр (включая 0)
+                const kmPositions = [];
+                // Старт 0 км
+                const startPoint = turf.along(line, 0, { units: 'kilometers' });
+                kmPositions.push({ distKm: 0, point: startPoint });
+                let step = 1;
+                let currentDist = step;
+                while (currentDist <= totalKm) {
+                    const alongPoint = turf.along(line, currentDist, { units: 'kilometers' });
+                    kmPositions.push({ distKm: currentDist, point: alongPoint });
+                    currentDist += step;
+                }
+                
+                // Преобразуем для Leaflet линию
+                const latlngs = points.map(p => [p[1], p[0]]);
+                const polyline = L.polyline(latlngs, { color: '#2a9d8f', weight: 5, opacity: 0.9, smoothFactor: 1.2 });
+                polyline.bindPopup(`📏 Дистанция: <strong>${totalKm.toFixed(2)} км</strong><br>📍 Точек: ${points.length}`);
+                
+                // СОЗДАНИЕ МЕТОК: только ЦИФРА (без "км", без иконок и лишнего текста)
+                const numberMarkers = [];
+                for (let i = 0; i < kmPositions.length; i++) {
+                    const kmItem = kmPositions[i];
+                    const coords = kmItem.point.geometry.coordinates; // [lng, lat]
+                    const kmVal = kmItem.distKm;
+                    // Форматируем цифру: для целых без десятичных, для дробных до 2 знаков
+                    let displayNumber;
+                    if (Number.isInteger(kmVal)) displayNumber = kmVal.toString();
+                    else displayNumber = kmVal.toFixed(2);
+                    // Только число, без каких-либо единиц измерения или символов
+                    const labelText = displayNumber;
+                    
+                    // Минималистичный divIcon с одной цифрой
+                    const numberIcon = L.divIcon({
+                        className: 'km-number-marker',
+                        html: `<div class="km-number-label">${labelText}</div>`,
+                        iconSize: [32, 22],   // компактно под 2-3 цифры
+                        popupAnchor: [0, -12]
+                    });
+                    const marker = L.marker([coords[1], coords[0]], { icon: numberIcon });
+                    
+                    // Вычисляем остаточный путь до финиша для попапа
+                    const pointForRemaining = turf.point(coords);
+                    const remainingDist = getRemainingDistanceFromPoint(pointForRemaining, line, totalKm);
+                    let remainingText = "ошибка расчёта";
+                    if (remainingDist !== null && !isNaN(remainingDist)) {
+                        remainingText = `${remainingDist.toFixed(2)} км`;
+                    }
+                    // Попап: показывает километровую отметку (цифру) и остаточный путь
+                    const popupHtml = `
+                        <div style="font-size:13px; text-align:center; min-width:150px;">
+                            <strong>📍 Отметка ${displayNumber} км</strong><br>
+                            <span style="background:#1b4d2e; padding:4px 10px; border-radius:24px; display:inline-block; margin-top:6px; color:#ffeaac;">
+                                ➡️ Остаток: ${remainingText}
+                            </span><br>
+                            <small>от этой точки до конца маршрута</small>
+                        </div>
+                    `;
+                    marker.bindPopup(popupHtml);
+                    numberMarkers.push(marker);
+                }
+                
+                resolve({
+                    polyline: polyline,
+                    kmMarkers: numberMarkers,
+                    totalLength: totalKm,
+                    lineGeoJson: line,
+                    pointsCount: points.length
+                });
+            };
+            reader.onerror = () => reject("Ошибка чтения файла");
+            reader.readAsText(file);
+        });
+    }
+
+    // Загрузка и отображение трека (очищает предыдущий)
+    async function loadAndRenderGpx(file) {
+        if (!file) return;
+        setStatus(`⏳ Анализ ${file.name}...`);
+        try {
+            const track = await parseGpxAndBuildNumberOnlyTrack(file);
+            clearAllTracksAndMarkers();
+            // Добавляем линию трека
+            track.polyline.addTo(map);
+            currentPolyline = track.polyline;
+            // Добавляем метки (только цифры)
+            track.kmMarkers.forEach(m => kmMarkersLayer.addLayer(m));
+            // Сохраняем геометрию для возможного использования
+            fullLineGeoJson = track.lineGeoJson;
+            totalTrackLengthKm = track.totalLength;
+            // Масштабируем под трек
+            try {
+                const bounds = track.polyline.getBounds();
+                if (bounds.isValid()) map.fitBounds(bounds, { padding: [45, 45] });
+            } catch(e) { console.warn(e); }
+            setStatus(`✅ "${file.name}" | Длина: ${track.totalLength.toFixed(2)} км | Меток: ${track.kmMarkers.length} (только цифры)`);
+        } catch (err) {
+            console.error(err);
+            setStatus(`❌ Ошибка: ${err.toString().slice(0, 120)}`, true);
+        }
+    }
+
+    // ----- ГЕОЛОКАЦИЯ (телефон / ПК) -----
+    let userLocationMarker = null;
+    let userAccuracyCircle = null;
+    
+    function updateUserLocation(position) {
+        const lat = position.coords.latitude;
+        const lng = position.coords.longitude;
+        const accuracy = position.coords.accuracy;
+        if (userLocationMarker) map.removeLayer(userLocationMarker);
+        if (userAccuracyCircle) map.removeLayer(userAccuracyCircle);
+        
+        const customIcon = L.divIcon({
+            html: `<div style="background:#2c7da0; width:14px; height:14px; border-radius:50%; border:2px solid white; box-shadow:0 0 6px #000;"></div>`,
+            iconSize: [18, 18],
+            className: 'user-dot'
+        });
+        userLocationMarker = L.marker([lat, lng], { icon: customIcon }).addTo(map);
+        userLocationMarker.bindPopup(`📍 Ваша позиция<br>Точность ~${accuracy ? Math.round(accuracy) : '?'} м`).openPopup();
+        if (accuracy) {
+            userAccuracyCircle = L.circle([lat, lng], { radius: accuracy, color: '#4c9fcf', weight: 1, fillColor: '#6ab0de', fillOpacity: 0.12 }).addTo(map);
+        }
+        map.setView([lat, lng], Math.max(15, map.getZoom()));
+        setStatus(`📍 Локация: ${lat.toFixed(5)}, ${lng.toFixed(5)} | ±${accuracy ? Math.round(accuracy) : '?'} м`);
+    }
+    
+    function handleGeoError(error) {
+        let msg = "";
+        switch(error.code) {
+            case error.PERMISSION_DENIED: msg = "Доступ запрещён. Разрешите геолокацию."; break;
+            case error.POSITION_UNAVAILABLE: msg = "Не удалось определить позицию."; break;
+            case error.TIMEOUT: msg = "Таймаут геолокации."; break;
+            default: msg = "Ошибка определения координат.";
+        }
+        setStatus(`⚠️ ${msg}`, true);
+    }
+    
+    function getUserGeolocation() {
+        if (!navigator.geolocation) {
+            setStatus("❌ Браузер не поддерживает геолокацию.", true);
+            return;
+        }
+        setStatus("🔎 Определение местоположения...");
+        navigator.geolocation.getCurrentPosition(updateUserLocation, handleGeoError, {
+            enableHighAccuracy: true, timeout: 12000, maximumAge: 5000
+        });
+    }
+    
+    // ----- Drag & drop (перетаскивание GPX) -----
+    const mapDiv = document.getElementById('map');
+    mapDiv.addEventListener('dragover', (e) => { e.preventDefault(); mapDiv.style.opacity = '0.95'; });
+    mapDiv.addEventListener('dragleave', () => { mapDiv.style.opacity = '1'; });
+    mapDiv.addEventListener('drop', (e) => {
+        e.preventDefault();
+        mapDiv.style.opacity = '1';
+        const files = e.dataTransfer.files;
+        if (files.length > 0 && files[0].name.toLowerCase().endsWith('.gpx')) {
+            loadAndRenderGpx(files[0]);
+        } else {
+            setStatus("❌ Перетащите файл GPX (.gpx)", true);
+        }
+    });
+    
+    // ----- Обработчики кнопок -----
+    document.getElementById('fileInput').addEventListener('change', (event) => {
+        const file = event.target.files[0];
+        if (!file) return;
+        if (!file.name.toLowerCase().endsWith('.gpx')) {
+            setStatus("❌ Выберите GPX файл", true);
+            return;
+        }
+        loadAndRenderGpx(file);
+        event.target.value = '';
+    });
+    
+    document.getElementById('locateBtn').addEventListener('click', getUserGeolocation);
+    document.getElementById('clearTracksBtn').addEventListener('click', () => {
+        clearAllTracksAndMarkers();
+        setStatus("🗑 Трек и цифровые метки удалены.");
+    });
+    
+    // Адаптация под мобильные устройства
+    window.addEventListener('resize', () => { setTimeout(() => map.invalidateSize(), 100); });
+    map.invalidateSize();
+    
+    setStatus("📁 Загрузите GPX. Метки — только цифры (километры). Нажмите на метку для остаточного пути.");
+    
+    console.log("Приложение загружено: метки содержат только цифры, без 'км', без иконок");
+</script>
+</body>
+</html>
